@@ -1,7 +1,7 @@
 // 1. Import our tools
 require('dotenv').config({ path: '.env.local' }); // Read .env.local
 const express = require('express');
-const cors = require('cors');
+const cors = require('cors'); // Already required - no change needed
 const { neon } = require('@neondatabase/serverless'); // Import Neon
 const { put } = require('@vercel/blob');
 
@@ -23,12 +23,75 @@ const sql = neon(connectionString);
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// 5. Set up middleware
-app.use(cors());
+// ========== CHANGED: Enhanced CORS Configuration ==========
+// This is the key fix for your "NetworkError" issue
+const allowedOrigins = [
+  'http://localhost:3000',  // Your local frontend
+  'https://world-class-blog-frontend.vercel.app'  // Add your actual Vercel frontend URL here when deployed
+];
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (e.g., curl, Postman)
+    if (!origin) return callback(null, true);
+    
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // For development only - remove in production
+    console.log(`CORS blocked request from: ${origin}`);
+    return callback(new Error('Not allowed by CORS'), false);
+  },
+  credentials: true,  // REQUIRED for cookies to work across domains
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Set up middleware (no changes needed to these)
 app.use(express.json({ limit: '10mb' }));
 app.use(express.raw({ type: 'image/*', limit: '10mb' }));
 
-// --- API ROUTES ---
+// ========== CHANGED: Authentication route with cookie support ==========
+// 12. AUTHENTICATION ROUTE - MODIFIED TO SET HTTPONLY COOKIE
+app.post('/api/auth/login', (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (password === ADMIN_PASSWORD) {
+      // Generate a simple token (in production, use a proper token library)
+      const token = Math.random().toString(36).substring(2, 15);
+      
+      // Set HttpOnly cookie that will be sent with future requests
+      res.cookie('auth-token', token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production', // Only use secure in production (HTTPS)
+        sameSite: 'none', // Required for cross-origin requests
+        maxAge: 24 * 60 * 60 * 1000 // 1 day
+      });
+      
+      res.status(200).json({ success: true, message: 'Login successful' });
+    } else {
+      res.status(401).json({ success: false, error: 'Invalid credentials' });
+    }
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'An internal server error occurred' });
+  }
+});
+
+// ========== ADDED: New logout route to clear the cookie ==========
+// This is needed for frontend logout functionality
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('auth-token', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'none'
+  });
+  res.status(200).json({ success: true, message: 'Logged out successfully' });
+});
+
+// --- REST OF YOUR EXISTING API ROUTES (NO CHANGES) ---
 
 // 6. Define our "GET all posts" route (for the /blog page)
 app.get('/api/posts', async (req, res) => {
@@ -80,10 +143,15 @@ app.get('/api/posts/:id', async (req, res) => {
 app.get('/api/posts/slug/:slug', async (req, res) => {
   try {
     const { slug } = req.params;
+    
+    // --- THIS IS THE FIX ---
+    // We now TRIM() both the database 'slug' column AND the input ${slug}
+    // This makes the match robust against whitespace in the database.
     const post = await sql`
       SELECT * FROM posts 
-      WHERE slug = TRIM(${slug})
+      WHERE TRIM(slug) = TRIM(${slug})
     `;
+    
     if (post.length === 0) {
       return res.status(404).json({ error: 'Post not found' });
     }
@@ -149,21 +217,6 @@ app.put('/api/posts/:id', async (req, res) => {
   }
 });
 
-
-// 12. AUTHENTICATION ROUTE
-app.post('/api/auth/login', (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (password === ADMIN_PASSWORD) {
-      res.status(200).json({ success: true, message: 'Login successful' });
-    } else {
-      res.status(401).json({ success: false, error: 'Invalid credentials' });
-    }
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'An internal server error occurred' });
-  }
-});
 
 // 13. DELETE POST ROUTE
 app.delete('/api/posts/:id', async (req, res) => {
