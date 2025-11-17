@@ -134,12 +134,11 @@ app.post("/api/auth/reader/google", async (req, res) => {
       userId = inserted[0].id;
     }
 
-    res.cookie("reader-id", String(userId), {
-      httpOnly: true,
-      secure: isProd,
-      sameSite: isProd ? "none" : "lax",
-      maxAge: 7 * 24 * 60 * 60 * 1000
-    });
+    res.clearCookie("reader-id", {
+  httpOnly: true,
+  secure: true,
+  sameSite: "none"
+});
 
     res.json({ user: { id: userId, name, email, avatar_url } });
   } catch (e) {
