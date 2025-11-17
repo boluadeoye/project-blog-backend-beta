@@ -1,6 +1,6 @@
 // index.js
 // Complete backend (Express) with posts, upload, likes, comments, and Google reader sign-in.
-// Drop-in replacement. Requires: google-auth-library, cookie-parser, @neondatabase/serverless, @vercel/blob
+// Requires: google-auth-library, cookie-parser, @neondatabase/serverless, @vercel/blob
 
 require("dotenv").config({ path: ".env.local" });
 const express = require("express");
@@ -53,9 +53,36 @@ app.use(cookieParser());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.raw({ type: "image/*", limit: "10mb" }));
 
-// ----- Helpers -----
-// Health
+// ----- Health -----
 app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+// ----- Reader cookie helpers (Secure + SameSite=None + Partitioned) -----
+function setReaderCookie(res, userId) {
+  const maxAge = 7 * 24 * 60 * 60; // 7 days (seconds)
+  const cookie = [
+    `reader-id=${encodeURIComponent(String(userId))}`,
+    "Path=/",
+    "HttpOnly",
+    "Secure",
+    "SameSite=None",
+    "Partitioned",
+    `Max-Age=${maxAge}`
+  ].join("; ");
+  res.setHeader("Set-Cookie", cookie);
+}
+
+function clearReaderCookie(res) {
+  const cookie = [
+    "reader-id=;",
+    "Path=/",
+    "HttpOnly",
+    "Secure",
+    "SameSite=None",
+    "Partitioned",
+    "Max-Age=0"
+  ].join("; ");
+  res.setHeader("Set-Cookie", cookie);
+}
 
 // Resolve current reader (Google-authenticated) by cookie
 async function getCurrentReaderId(req) {
@@ -134,11 +161,8 @@ app.post("/api/auth/reader/google", async (req, res) => {
       userId = inserted[0].id;
     }
 
-    res.clearCookie("reader-id", {
-  httpOnly: true,
-  secure: true,
-  sameSite: "none"
-});
+    // Set cross-site reader cookie (works even when third-party cookies are blocked)
+    setReaderCookie(res, userId);
 
     res.json({ user: { id: userId, name, email, avatar_url } });
   } catch (e) {
@@ -167,11 +191,7 @@ app.get("/api/auth/reader/me", async (req, res) => {
 });
 
 app.post("/api/auth/reader/logout", async (req, res) => {
-  res.clearCookie("reader-id", {
-    httpOnly: true,
-    secure: isProd,
-    sameSite: isProd ? "none" : "lax"
-  });
+  clearReaderCookie(res);
   res.json({ success: true });
 });
 
