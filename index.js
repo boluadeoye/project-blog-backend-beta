@@ -1,5 +1,6 @@
 // index.js
-// Complete backend (Express) with posts, upload, likes, comments, Google reader sign-in, and projects CRUD.
+// Backend with posts, upload, likes, comments, Google reader sign-in, and projects CRUD.
+// CORS now supports multiple origins + vercel preview allowance.
 
 require("dotenv").config({ path: ".env.local" });
 const express = require("express");
@@ -17,37 +18,64 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 if (!ADMIN_PASSWORD) throw new Error("ADMIN_PASSWORD is not set in .env.local");
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "";
 const isProd = process.env.NODE_ENV === "production";
 
+// ----- DB -----
 const sql = neon(connectionString);
+
+// ----- App -----
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-const allowedOrigins = ["http://localhost:3000"];
-if (FRONTEND_ORIGIN) allowedOrigins.push(FRONTEND_ORIGIN);
+// ----- CORS (multi origin + optional vercel previews) -----
+const RAW_ORIGINS =
+  (process.env.FRONTEND_ORIGINS || process.env.FRONTEND_ORIGIN || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+const DEFAULTS = ["http://localhost:3000"];
+const ALLOWED_SET = new Set([...DEFAULTS, ...RAW_ORIGINS]);
+const ALLOW_VERCEL_PREVIEWS =
+  String(process.env.ALLOW_VERCEL_PREVIEWS || "true").toLowerCase() === "true";
 
 app.use(
   cors({
     origin(origin, cb) {
+      // allow server-to-server or tools
       if (!origin) return cb(null, true);
-      if (allowedOrigins.includes(origin)) return cb(null, true);
-      console.log(`CORS blocked request from: ${origin}`);
-      return cb(new Error("Not allowed by CORS"), false);
+      try {
+        const url = new URL(origin);
+        const normalized = url.origin;
+
+        if (ALLOWED_SET.has(normalized)) return cb(null, true);
+
+        if (ALLOW_VERCEL_PREVIEWS && url.hostname.endsWith(".vercel.app")) {
+          return cb(null, true);
+        }
+
+        console.log(`CORS blocked origin: ${origin}`);
+        return cb(new Error("Not allowed by CORS"), false);
+      } catch {
+        console.log(`CORS bad origin format: ${origin}`);
+        return cb(new Error("Not allowed by CORS"), false);
+      }
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"]
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
+// ----- Parsers -----
 app.use(cookieParser());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.raw({ type: "image/*", limit: "10mb" }));
 
+// ----- Health -----
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
-// Cross-site cookie helpers (reader-id)
+// ----- Reader cookie helpers (Secure + None + Partitioned) -----
 function setReaderCookie(res, userId) {
   const secs = 7 * 24 * 60 * 60;
   const cookie = [
@@ -57,7 +85,7 @@ function setReaderCookie(res, userId) {
     "Secure",
     "SameSite=None",
     "Partitioned",
-    `Max-Age=${secs}`
+    `Max-Age=${secs}`,
   ].join("; ");
   res.setHeader("Set-Cookie", cookie);
 }
@@ -69,7 +97,7 @@ function clearReaderCookie(res) {
     "Secure",
     "SameSite=None",
     "Partitioned",
-    "Max-Age=0"
+    "Max-Age=0",
   ].join("; ");
   res.setHeader("Set-Cookie", cookie);
 }
@@ -81,7 +109,6 @@ async function getCurrentReaderId(req) {
   return id;
 }
 function isAdmin(req) {
-  // minimal: if admin cookie exists, allow mutating routes
   return Boolean(req.cookies["auth-token"]);
 }
 
@@ -95,7 +122,7 @@ app.post("/api/auth/login", async (req, res) => {
         httpOnly: true,
         secure: isProd,
         sameSite: isProd ? "none" : "lax",
-        maxAge: 24 * 60 * 60 * 1000
+        maxAge: 24 * 60 * 60 * 1000,
       });
       return res.status(200).json({ success: true, message: "Login successful" });
     }
@@ -109,7 +136,7 @@ app.post("/api/auth/logout", (req, res) => {
   res.clearCookie("auth-token", {
     httpOnly: true,
     secure: isProd,
-    sameSite: isProd ? "none" : "lax"
+    sameSite: isProd ? "none" : "lax",
   });
   res.json({ success: true, message: "Logged out successfully" });
 });
@@ -123,7 +150,10 @@ app.post("/api/auth/reader/google", async (req, res) => {
     const { idToken } = req.body || {};
     if (!idToken) return res.status(400).json({ error: "idToken required" });
 
-    const ticket = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: GOOGLE_CLIENT_ID,
+    });
     const payload = ticket.getPayload();
     if (!payload || !payload.sub) return res.status(400).json({ error: "Invalid Google token" });
 
@@ -169,7 +199,7 @@ app.post("/api/auth/reader/logout", async (req, res) => {
   res.json({ success: true });
 });
 
-// ---------------- Posts (existing) ----------------
+// ---------------- Posts ----------------
 app.get("/api/posts", async (req, res) => {
   try {
     const rows = await sql`SELECT * FROM posts ORDER BY created_at DESC`;
@@ -216,6 +246,7 @@ app.get("/api/posts/slug/:slug", async (req, res) => {
 });
 app.post("/api/posts", async (req, res) => {
   try {
+    if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
     const { title, slug, content } = req.body || {};
     if (!title || !slug) return res.status(400).json({ error: "Title and slug are required" });
     const inserted = await sql`
@@ -232,6 +263,7 @@ app.post("/api/posts", async (req, res) => {
 });
 app.put("/api/posts/:id", async (req, res) => {
   try {
+    if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
     const id = Number(req.params.id);
     const { title, slug, content } = req.body || {};
     if (!title || !slug) return res.status(400).json({ error: "Title and slug are required" });
@@ -251,6 +283,7 @@ app.put("/api/posts/:id", async (req, res) => {
 });
 app.delete("/api/posts/:id", async (req, res) => {
   try {
+    if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
     const id = Number(req.params.id);
     const deleted = await sql`DELETE FROM posts WHERE id = ${id} RETURNING *`;
     if (deleted.length === 0) return res.status(404).json({ error: "Post not found" });
@@ -261,7 +294,7 @@ app.delete("/api/posts/:id", async (req, res) => {
   }
 });
 
-// ---------------- Upload (existing) ----------------
+// ---------------- Upload ----------------
 app.post("/api/upload", async (req, res) => {
   const filename = req.query.filename;
   const fileBody = req.body;
@@ -275,7 +308,7 @@ app.post("/api/upload", async (req, res) => {
   }
 });
 
-// ---------------- Likes (existing) ----------------
+// ---------------- Likes ----------------
 app.get("/api/posts/:id/likes", async (req, res) => {
   try {
     const postId = Number(req.params.id);
@@ -318,7 +351,7 @@ app.post("/api/posts/:id/like", async (req, res) => {
   }
 });
 
-// ---------------- Comments (existing) ----------------
+// ---------------- Comments ----------------
 app.get("/api/posts/:id/comments", async (req, res) => {
   try {
     const postId = Number(req.params.id);
@@ -361,8 +394,7 @@ app.post("/api/posts/:id/comments", async (req, res) => {
   }
 });
 
-// ---------------- Projects (NEW) ----------------
-// List
+// ---------------- Projects ----------------
 app.get("/api/projects", async (req, res) => {
   try {
     const rows = await sql`SELECT * FROM projects ORDER BY created_at DESC`;
@@ -372,7 +404,6 @@ app.get("/api/projects", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch projects" });
   }
 });
-// Get one
 app.get("/api/projects/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -384,7 +415,6 @@ app.get("/api/projects/:id", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch project" });
   }
 });
-// Create (admin)
 app.post("/api/projects", async (req, res) => {
   try {
     if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
@@ -401,7 +431,6 @@ app.post("/api/projects", async (req, res) => {
     res.status(500).json({ error: "Failed to create project" });
   }
 });
-// Update (admin)
 app.put("/api/projects/:id", async (req, res) => {
   try {
     if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
@@ -422,7 +451,6 @@ app.put("/api/projects/:id", async (req, res) => {
     res.status(500).json({ error: "Failed to update project" });
   }
 });
-// Delete (admin)
 app.delete("/api/projects/:id", async (req, res) => {
   try {
     if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
