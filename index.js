@@ -1,6 +1,6 @@
 // index.js
-// Backend with posts, upload, likes, comments, Google reader sign-in, and projects CRUD.
-// CORS now supports multiple origins + vercel preview allowance.
+// Backend with posts, upload, likes, comments, Google reader sign-in, projects CRUD,
+// and newsletter subscriptions. CORS supports multiple origins + vercel previews.
 
 require("dotenv").config({ path: ".env.local" });
 const express = require("express");
@@ -42,18 +42,13 @@ const ALLOW_VERCEL_PREVIEWS =
 app.use(
   cors({
     origin(origin, cb) {
-      // allow server-to-server or tools
       if (!origin) return cb(null, true);
       try {
-        const url = new URL(origin);
-        const normalized = url.origin;
-
-        if (ALLOWED_SET.has(normalized)) return cb(null, true);
-
-        if (ALLOW_VERCEL_PREVIEWS && url.hostname.endsWith(".vercel.app")) {
+        const u = new URL(origin);
+        const norm = u.origin;
+        if (ALLOWED_SET.has(norm)) return cb(null, true);
+        if (ALLOW_VERCEL_PREVIEWS && u.hostname.endsWith(".vercel.app"))
           return cb(null, true);
-        }
-
         console.log(`CORS blocked origin: ${origin}`);
         return cb(new Error("Not allowed by CORS"), false);
       } catch {
@@ -461,6 +456,51 @@ app.delete("/api/projects/:id", async (req, res) => {
   } catch (e) {
     console.error("Error deleting project:", e);
     res.status(500).json({ error: "Failed to delete project" });
+  }
+});
+
+// ---------------- Subscribers (NEW) ----------------
+
+// Subscribe (email + optional name)
+// POST /api/subscribe  body: { email, name? }
+app.post("/api/subscribe", async (req, res) => {
+  try {
+    const { email, name } = req.body || {};
+    const em = String(email || "").trim().toLowerCase();
+
+    if (!em || !/^[\w.+-]+@[\w.-]+\.[a-z]{2,}$/i.test(em)) {
+      return res.status(400).json({ error: "Valid email is required" });
+    }
+
+    // Insert or ignore duplicate
+    const inserted = await sql`
+      INSERT INTO subscribers (email, name)
+      VALUES (${em}, ${name || null})
+      ON CONFLICT (email) DO NOTHING
+      RETURNING id, email, name, created_at
+    `;
+
+    if (inserted.length === 0) {
+      // already exists
+      return res.json({ success: true, already: true });
+    }
+
+    return res.json({ success: true, already: false });
+  } catch (e) {
+    console.error("Subscribe error:", e);
+    res.status(500).json({ error: "Failed to subscribe" });
+  }
+});
+
+// Admin list subscribers
+app.get("/api/subscribers", async (req, res) => {
+  try {
+    if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
+    const rows = await sql`SELECT id, email, name, confirmed, created_at FROM subscribers ORDER BY created_at DESC`;
+    res.json(rows);
+  } catch (e) {
+    console.error("List subscribers error:", e);
+    res.status(500).json({ error: "Failed to fetch subscribers" });
   }
 });
 
