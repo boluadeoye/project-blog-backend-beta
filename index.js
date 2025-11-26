@@ -1,6 +1,5 @@
 // index.js
-// Backend with posts, upload, likes, comments, Google reader sign-in, projects CRUD,
-// and newsletter subscriptions. CORS supports multiple origins + vercel previews.
+// Backend with posts, upload, likes, comments, Google reader sign-in, projects CRUD.
 
 require("dotenv").config({ path: ".env.local" });
 const express = require("express");
@@ -70,7 +69,7 @@ app.use(express.raw({ type: "image/*", limit: "10mb" }));
 // ----- Health -----
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
-// ----- Reader cookie helpers (Secure + None + Partitioned) -----
+// ----- Reader cookie helpers -----
 function setReaderCookie(res, userId) {
   const secs = 7 * 24 * 60 * 60;
   const cookie = [
@@ -194,22 +193,65 @@ app.post("/api/auth/reader/logout", async (req, res) => {
   res.json({ success: true });
 });
 
-// ---------------- Posts ----------------
+// ---------------- Posts (with filters) ----------------
+function parseLimit(v, d = 20, max = 50) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n <= 0) return d;
+  return Math.min(n, max);
+}
+function parseOffset(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n;
+}
+
 app.get("/api/posts", async (req, res) => {
   try {
-    const rows = await sql`SELECT * FROM posts ORDER BY created_at DESC`;
+    const type = req.query.type ? String(req.query.type).trim() : null;
+    const limit = parseLimit(req.query.limit, 20, 50);
+    const offset = parseOffset(req.query.offset);
+    let tag = null;
+    if (req.query.tag) tag = String(req.query.tag).trim();
+    else if (req.query.tags) {
+      const parts = String(req.query.tags).split(",").map((s) => s.trim()).filter(Boolean);
+      if (parts.length) tag = parts[0];
+    }
+    const includeDrafts = isAdmin(req) && String(req.query.includeDrafts || "false") === "true";
+
+    let rows;
+    if (type && tag) {
+      rows = includeDrafts
+        ? await sql`SELECT * FROM posts WHERE type = ${type} AND (tags @> ARRAY[${tag}]::text[]) ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`
+        : await sql`SELECT * FROM posts WHERE published = TRUE AND type = ${type} AND (tags @> ARRAY[${tag}]::text[]) ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
+    } else if (type) {
+      rows = includeDrafts
+        ? await sql`SELECT * FROM posts WHERE type = ${type} ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`
+        : await sql`SELECT * FROM posts WHERE published = TRUE AND type = ${type} ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
+    } else if (tag) {
+      rows = includeDrafts
+        ? await sql`SELECT * FROM posts WHERE (tags @> ARRAY[${tag}]::text[]) ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`
+        : await sql`SELECT * FROM posts WHERE published = TRUE AND (tags @> ARRAY[${tag}]::text[]) ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
+    } else {
+      rows = includeDrafts
+        ? await sql`SELECT * FROM posts ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`
+        : await sql`SELECT * FROM posts WHERE published = TRUE ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
+    }
+
     res.json(rows);
   } catch (e) {
     console.error("Error fetching posts:", e);
     res.status(500).json({ error: "Failed to fetch posts" });
   }
 });
+
 app.get("/api/posts/featured", async (req, res) => {
   try {
+    const limit = parseLimit(req.query.limit, 3, 12);
     const rows = await sql`
       SELECT * FROM posts
+      WHERE published = TRUE AND (tags @> ARRAY['home-featured']::text[])
       ORDER BY created_at DESC
-      LIMIT 3
+      LIMIT ${limit}
     `;
     res.json(rows);
   } catch (e) {
@@ -217,6 +259,7 @@ app.get("/api/posts/featured", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch featured posts" });
   }
 });
+
 app.get("/api/posts/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -228,6 +271,7 @@ app.get("/api/posts/:id", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch post" });
   }
 });
+
 app.get("/api/posts/slug/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
@@ -239,14 +283,28 @@ app.get("/api/posts/slug/:slug", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch post" });
   }
 });
+
 app.post("/api/posts", async (req, res) => {
   try {
     if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
-    const { title, slug, content } = req.body || {};
+    const {
+      title,
+      slug,
+      content = null,
+      type = "article",
+      tags = [],
+      meta = {},
+      published = true,
+    } = req.body || {};
     if (!title || !slug) return res.status(400).json({ error: "Title and slug are required" });
+
     const inserted = await sql`
-      INSERT INTO posts (title, slug, content)
-      VALUES (TRIM(${title}), TRIM(${slug}), TRIM(${content}))
+      INSERT INTO posts (title, slug, content, type, tags, meta, published)
+      VALUES (
+        TRIM(${title}), TRIM(${slug}), ${content},
+        TRIM(${type}), ${Array.isArray(tags) ? tags : []},
+        ${meta}::jsonb, ${Boolean(published)}
+      )
       RETURNING *
     `;
     res.status(201).json(inserted[0]);
@@ -256,15 +314,28 @@ app.post("/api/posts", async (req, res) => {
     res.status(500).json({ error: "Failed to create post" });
   }
 });
+
 app.put("/api/posts/:id", async (req, res) => {
   try {
     if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
     const id = Number(req.params.id);
-    const { title, slug, content } = req.body || {};
+    const {
+      title, slug, content = null, type = "article",
+      tags = [], meta = {}, published = true,
+    } = req.body || {};
     if (!title || !slug) return res.status(400).json({ error: "Title and slug are required" });
+
     const updated = await sql`
       UPDATE posts
-      SET title = TRIM(${title}), slug = TRIM(${slug}), content = TRIM(${content})
+      SET
+        title = TRIM(${title}),
+        slug = TRIM(${slug}),
+        content = ${content},
+        type = TRIM(${type}),
+        tags = ${Array.isArray(tags) ? tags : []},
+        meta = ${meta}::jsonb,
+        published = ${Boolean(published)},
+        updated_at = NOW()
       WHERE id = ${id}
       RETURNING *
     `;
@@ -276,6 +347,7 @@ app.put("/api/posts/:id", async (req, res) => {
     res.status(500).json({ error: "Failed to update post" });
   }
 });
+
 app.delete("/api/posts/:id", async (req, res) => {
   try {
     if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
@@ -399,111 +471,9 @@ app.get("/api/projects", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch projects" });
   }
 });
-app.get("/api/projects/:id", async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const rows = await sql`SELECT * FROM projects WHERE id = ${id}`;
-    if (rows.length === 0) return res.status(404).json({ error: "Project not found" });
-    res.json(rows[0]);
-  } catch (e) {
-    console.error("Error fetching project:", e);
-    res.status(500).json({ error: "Failed to fetch project" });
-  }
-});
-app.post("/api/projects", async (req, res) => {
-  try {
-    if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
-    const { title, url, description, image_url, tags } = req.body || {};
-    if (!title || !url) return res.status(400).json({ error: "Title and url are required" });
-    const inserted = await sql`
-      INSERT INTO projects (title, url, description, image_url, tags)
-      VALUES (${title}, ${url}, ${description || null}, ${image_url || null}, ${Array.isArray(tags) ? tags : null})
-      RETURNING *
-    `;
-    res.status(201).json(inserted[0]);
-  } catch (e) {
-    console.error("Error creating project:", e);
-    res.status(500).json({ error: "Failed to create project" });
-  }
-});
-app.put("/api/projects/:id", async (req, res) => {
-  try {
-    if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
-    const id = Number(req.params.id);
-    const { title, url, description, image_url, tags } = req.body || {};
-    if (!title || !url) return res.status(400).json({ error: "Title and url are required" });
-    const updated = await sql`
-      UPDATE projects
-      SET title=${title}, url=${url}, description=${description || null},
-          image_url=${image_url || null}, tags=${Array.isArray(tags) ? tags : null}
-      WHERE id = ${id}
-      RETURNING *
-    `;
-    if (updated.length === 0) return res.status(404).json({ error: "Project not found" });
-    res.json(updated[0]);
-  } catch (e) {
-    console.error("Error updating project:", e);
-    res.status(500).json({ error: "Failed to update project" });
-  }
-});
-app.delete("/api/projects/:id", async (req, res) => {
-  try {
-    if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
-    const id = Number(req.params.id);
-    const deleted = await sql`DELETE FROM projects WHERE id = ${id} RETURNING *`;
-    if (deleted.length === 0) return res.status(404).json({ error: "Project not found" });
-    res.json(deleted[0]);
-  } catch (e) {
-    console.error("Error deleting project:", e);
-    res.status(500).json({ error: "Failed to delete project" });
-  }
-});
 
-// ---------------- Subscribers (NEW) ----------------
-
-// Subscribe (email + optional name)
-// POST /api/subscribe  body: { email, name? }
-app.post("/api/subscribe", async (req, res) => {
-  try {
-    const { email, name } = req.body || {};
-    const em = String(email || "").trim().toLowerCase();
-
-    if (!em || !/^[\w.+-]+@[\w.-]+\.[a-z]{2,}$/i.test(em)) {
-      return res.status(400).json({ error: "Valid email is required" });
-    }
-
-    // Insert or ignore duplicate
-    const inserted = await sql`
-      INSERT INTO subscribers (email, name)
-      VALUES (${em}, ${name || null})
-      ON CONFLICT (email) DO NOTHING
-      RETURNING id, email, name, created_at
-    `;
-
-    if (inserted.length === 0) {
-      // already exists
-      return res.json({ success: true, already: true });
-    }
-
-    return res.json({ success: true, already: false });
-  } catch (e) {
-    console.error("Subscribe error:", e);
-    res.status(500).json({ error: "Failed to subscribe" });
-  }
-});
-
-// Admin list subscribers
-app.get("/api/subscribers", async (req, res) => {
-  try {
-    if (!isAdmin(req)) return res.status(401).json({ error: "Admin login required" });
-    const rows = await sql`SELECT id, email, name, confirmed, created_at FROM subscribers ORDER BY created_at DESC`;
-    res.json(rows);
-  } catch (e) {
-    console.error("List subscribers error:", e);
-    res.status(500).json({ error: "Failed to fetch subscribers" });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`✅ Backend server running on http://localhost:${PORT}`);
-});
+// ----- Start (local dev) -----
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Backend listening on http://localhost:${PORT}`));
+}
+module.exports = app;
